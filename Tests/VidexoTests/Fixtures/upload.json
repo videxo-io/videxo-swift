@@ -1,0 +1,8 @@
+{
+  "id": "up_0123456789abcdef01234567",
+  "input_url": "videxo://uploads/up_0123456789abcdef01234567",
+  "upload_url": "https://api.videxo.io/v1/uploads/up_0123456789abcdef01234567/content?signature=example",
+  "upload_url_expires_at": "2026-11-06T13:00:00.000Z",
+  "expires_at": "2026-11-07T12:00:00.000Z",
+  "max_size_bytes": 100000000
+}

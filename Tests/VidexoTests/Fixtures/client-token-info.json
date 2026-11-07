@@ -1,0 +1,7 @@
+{
+  "id": "ct_4m8x2k9q0c3v7n1r5t6b2z8w",
+  "chain_id": "ct_4m8x2k9q0c3v7n1r5t6b2z8w",
+  "expires_at": "2026-11-06T12:15:00.000Z",
+  "uploads": { "max_count": 1, "max_size_bytes": 50000000, "content_types": ["video/*"], "used": 0 },
+  "jobs": { "read": ["job_3k9x0c2mfq8w1n7r5t4b6v2z"] }
+}

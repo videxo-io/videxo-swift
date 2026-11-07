@@ -1,0 +1,37 @@
+{
+  "id": "job_3k9x0c2mfq8w1n7r5t4b6v2z",
+  "state": "failed",
+  "progress": 0.5,
+  "error": {
+    "code": "processing_failed",
+    "reason": "ffmpeg_error",
+    "message": "The file could not be processed.",
+    "retryable": false,
+    "log_tail": "Invalid data found when processing input"
+  },
+  "outputs": [
+    {
+      "alias": "out_web",
+      "filename": "web.mp4",
+      "size_bytes": 1048576,
+      "content_type": "video/mp4",
+      "expires_at": "2026-11-07T12:00:00.000Z",
+      "deleted_at": null,
+      "download_url": "https://api.videxo.io/v1/files/example/web.mp4",
+      "download_url_expires_at": "2026-11-06T13:00:00.000Z"
+    },
+    {
+      "alias": "out_old",
+      "filename": "old.mp4",
+      "size_bytes": 0,
+      "content_type": "video/mp4",
+      "expires_at": "2026-11-05T12:00:00.000Z",
+      "deleted_at": "2026-11-05T12:00:00.000Z",
+      "download_url": null,
+      "download_url_expires_at": null
+    }
+  ],
+  "created_at": "2026-11-06T12:00:00.000Z",
+  "started_at": "2026-11-06T12:00:01.000Z",
+  "finished_at": "2026-11-06T12:00:09Z"
+}

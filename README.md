@@ -9,7 +9,7 @@ backend mints, or a one-time upload URL your backend made. Jobs are always creat
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/videxo-io/videxo-swift", from: "0.1.0")
+.package(url: "https://github.com/videxo-io/videxo-swift", from: "0.2.0")
 // and in your target's dependencies:
 .product(name: "Videxo", package: "videxo-swift")
 ```
@@ -35,6 +35,21 @@ let completed = try await VidexoUpload().send(file: fileURL, to: uploadURL, cont
 The upload URL takes one PUT within one hour, so nothing retries it. After a failed PUT, create a
 new upload.
 
+## Multipart uploads
+
+A file past 100 MB, or any with `multipart: true`, goes as a multipart upload: in parts copied from
+the file's ranges, three at a time, each sent again after a lost connection, then completed. Sending
+it again reads the parts received and sends only the others, also after a relaunch. Cancelling
+aborts it.
+
+```swift
+let upload = try await videxo.uploads.create(forFile: fileURL, multipart: true)
+let completed = try await VidexoUpload().send(file: fileURL, upload: upload)
+// From your backend: let upload = try Upload(json: answerFromYourBackend)
+```
+
+Keep the `Upload` (it is `Codable`) to resume: its URLs work for 6 hours and need no API key.
+
 ## Upload in the background
 
 ```swift
@@ -42,15 +57,19 @@ let uploader = BackgroundUploader(identifier: "com.example.app.uploads") { event
     if case let .finished(upload, result) = event { save(upload, result) }
 }
 let upload = try await videxo.uploads.create(forFile: fileInYourContainer)
-try uploader.start(file: fileInYourContainer, to: upload.uploadURL, tag: upload.inputURL)
+try await uploader.start(file: fileInYourContainer, upload: upload, tag: upload.inputURL)
 ```
 
 Make the uploader once, early in the app's launch, and pass the system's completion handler from
 `application(_:handleEventsForBackgroundURLSession:completionHandler:)` to `handleEvents`. A file
-from a picker is outside your container: copy it first, and keep it until `finished`.
+from a picker is outside your container: copy it first, and keep it until `finished`. A multipart
+upload is one task per part; its part files and its state stay in Application Support until
+`finished`.
 
 Background upload has not yet been tested on a device: so far it has only run on macOS while the
-process stays alive, not after an app is suspended or relaunched.
+process stays alive, not after an app is suspended or relaunched. A multipart upload's background
+tasks have run in tests on a plain session, and its pick-up after a relaunch with a second uploader
+in the same process.
 
 ## Follow a job
 

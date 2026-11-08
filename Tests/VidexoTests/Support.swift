@@ -165,18 +165,33 @@ final class LocalServer: @unchecked Sendable {
     }
 
     enum Reply {
-        case answer(status: Int, body: String)
+        case answer(status: Int, body: String, headers: [String: String] = [:])
         case dropAfterHeaders
+        /// Reads the whole request, then closes the connection without an answer.
+        case drop
+        /// Answers after a wait, as a slow part does.
+        indirect case after(TimeInterval, Reply)
     }
 
     let port: UInt16
     private let listener: Int32
     private let lock = NSLock()
-    private let reply: Reply
+    private let respond: @Sendable (Received) -> Reply
+    private let dropsAfterHeaders: Bool
     private var received: [Received] = []
 
-    init(reply: Reply) throws {
-        self.reply = reply
+    convenience init(reply: Reply) throws {
+        if case .dropAfterHeaders = reply {
+            try self.init(dropsAfterHeaders: true) { _ in reply }
+        } else {
+            try self.init(dropsAfterHeaders: false) { _ in reply }
+        }
+    }
+
+    /// A server whose every answer comes from `respond`, given the whole request.
+    init(dropsAfterHeaders: Bool = false, respond: @escaping @Sendable (Received) -> Reply) throws {
+        self.respond = respond
+        self.dropsAfterHeaders = dropsAfterHeaders
         #if canImport(Glibc)
         let descriptor = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
         #else
@@ -241,7 +256,7 @@ final class LocalServer: @unchecked Sendable {
             headers[line[..<colon].lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
         }
         if headers["expect"] != nil { _ = "HTTP/1.1 100 Continue\r\n\r\n".withCString { send(connection, $0, strlen($0), 0) } }
-        if case .dropAfterHeaders = reply {
+        if dropsAfterHeaders {
             record(Received(requestLine: lines[0], headers: headers, body: Data()))
             return
         }
@@ -252,9 +267,16 @@ final class LocalServer: @unchecked Sendable {
             if count <= 0 { return }
             body.append(contentsOf: chunk[0..<count])
         }
-        record(Received(requestLine: lines[0], headers: headers, body: body))
-        if case let .answer(status, text) = reply {
-            let answer = "HTTP/1.1 \(status) Answer\r\nContent-Type: application/json\r\nRequest-Id: req_header\r\nContent-Length: \(text.utf8.count)\r\nConnection: close\r\n\r\n\(text)"
+        let request = Received(requestLine: lines[0], headers: headers, body: body)
+        record(request)
+        var reply = respond(request)
+        while case let .after(seconds, next) = reply {
+            Thread.sleep(forTimeInterval: seconds)
+            reply = next
+        }
+        if case let .answer(status, text, extra) = reply {
+            let more = extra.map { "\($0.key): \($0.value)\r\n" }.joined()
+            let answer = "HTTP/1.1 \(status) Answer\r\nContent-Type: application/json\r\nRequest-Id: req_header\r\n\(more)Content-Length: \(text.utf8.count)\r\nConnection: close\r\n\r\n\(text)"
             _ = answer.withCString { send(connection, $0, strlen($0), 0) }
         }
     }

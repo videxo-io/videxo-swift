@@ -6,9 +6,10 @@ import FoundationNetworking
 import UniformTypeIdentifiers
 #endif
 
-// Sending the bytes of a file to an upload's one-time URL. The URL holds no API key, so it may come from
-// a client token or from your backend. It takes one PUT, within one hour: nothing here retries it, and
-// after a failed PUT the next try needs a new upload.
+// Sending the bytes of a file to an upload's URL. The URL holds no API key, so it may come from a client
+// token or from your backend. A single upload takes one PUT, within one hour: nothing here retries it,
+// and after a failed PUT the next try needs a new upload. A multipart upload (Multipart.swift) sends its
+// parts again on their own and resumes.
 
 private let defaultContentType = "application/octet-stream"
 
@@ -47,8 +48,9 @@ func plainFilename(_ name: String) -> String {
 }
 
 /// The answer of an upload URL, or why there is none.
-func completedUpload(status: Int?, headers: HTTPHeaders, body: Data, failure: Error?) -> Result<CompletedUpload, VidexoError> {
-    if let failure {
+func completedUpload(_ answer: TaskAnswer) -> Result<CompletedUpload, VidexoError> {
+    let (status, headers, body) = (answer.status, answer.headers, answer.body)
+    if let failure = answer.failure {
         if isCancellation(failure) { return .failure(sdkError(.aborted, "The upload was aborted.")) }
         if (failure as? URLError)?.code == .timedOut { return .failure(sdkError(.timeout, "The upload did not finish in time.")) }
         // Only the fixed sentence: a URL error's details hold the upload URL.
@@ -67,11 +69,11 @@ final class UploadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendabl
     private let lock = NSLock()
     private var answers: [Int: Data] = [:]
     private let onProgress: @Sendable (URLSessionTask, Int64, Int64) -> Void
-    private let onComplete: @Sendable (URLSessionTask, Result<CompletedUpload, VidexoError>) -> Void
+    private let onComplete: @Sendable (URLSessionTask, TaskAnswer) -> Void
 
     init(
         onProgress: @escaping @Sendable (URLSessionTask, Int64, Int64) -> Void,
-        onComplete: @escaping @Sendable (URLSessionTask, Result<CompletedUpload, VidexoError>) -> Void
+        onComplete: @escaping @Sendable (URLSessionTask, TaskAnswer) -> Void
     ) {
         self.onProgress = onProgress
         self.onComplete = onComplete
@@ -101,7 +103,7 @@ final class UploadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         lock.unlock()
         let response = task.response as? HTTPURLResponse
         let headers = response.map(lowercasedHeaders) ?? [:]
-        onComplete(task, completedUpload(status: response?.statusCode, headers: headers, body: body, failure: error))
+        onComplete(task, TaskAnswer(status: response?.statusCode, headers: headers, body: body, failure: error))
     }
 
     #if !canImport(FoundationNetworking)
@@ -115,17 +117,27 @@ final class UploadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendabl
 
 /// One upload under way: its result, and pause, resume and cancel.
 public final class UploadHandle: @unchecked Sendable {
+    /// What pause, resume and cancel reach: a single PUT's task, or a multipart upload's parts.
+    struct Controls: Sendable {
+        let pause: @Sendable () -> Void
+        let resume: @Sendable () -> Void
+        let cancel: @Sendable () -> Void
+    }
+
     private let lock = NSLock()
     private var result: Result<CompletedUpload, VidexoError>?
     private var waiters: [CheckedContinuation<CompletedUpload, Error>] = []
-    private var task: URLSessionTask?
+    private var controls: Controls?
+    private var cancelled = false
 
     init() {}
 
-    fileprivate func started(_ task: URLSessionTask) {
+    fileprivate func started(_ controls: Controls) {
         lock.lock()
-        self.task = task
+        self.controls = controls
+        let cancel = cancelled
         lock.unlock()
+        if cancel { controls.cancel() }
     }
 
     fileprivate func finish(_ result: Result<CompletedUpload, VidexoError>) {
@@ -133,9 +145,15 @@ public final class UploadHandle: @unchecked Sendable {
         let waiting = waiters
         waiters = []
         self.result = result
-        task = nil
+        controls = nil
         lock.unlock()
         for waiter in waiting { waiter.resume(with: result.mapError { $0 as Error }) }
+    }
+
+    private var current: Controls? {
+        lock.lock()
+        defer { lock.unlock() }
+        return controls
     }
 
     /// The completed upload, once every byte arrived.
@@ -154,30 +172,31 @@ public final class UploadHandle: @unchecked Sendable {
         }
     }
 
-    /// Stops sending and keeps the connection. The URL allows one PUT: when the connection ends while
-    /// paused, the upload fails and the next try needs a new upload.
+    /// Stops sending. A single upload keeps its connection; its URL allows one PUT, so when the
+    /// connection ends while paused, the upload fails and the next try needs a new upload. A multipart
+    /// upload holds its parts under way and starts no more.
     public func pause() {
-        lock.lock()
-        defer { lock.unlock() }
-        task?.suspend()
+        current?.pause()
     }
 
     public func resume() {
-        lock.lock()
-        defer { lock.unlock() }
-        task?.resume()
+        current?.resume()
     }
 
-    /// Ends the upload, with `aborted` as its result. The URL is used up once bytes have been sent.
+    /// Ends the upload, with `aborted` as its result. A single upload's URL is used up once bytes have
+    /// been sent; a multipart upload is aborted, its received parts deleted.
     public func cancel() {
         lock.lock()
-        defer { lock.unlock() }
-        task?.cancel()
+        cancelled = true
+        let controls = controls
+        lock.unlock()
+        controls?.cancel()
     }
 }
 
-/// Sends a file to an upload's one-time URL, from a client token's upload or from your backend, while
-/// the app runs. For an upload that goes on when the app is suspended, see `BackgroundUploader`.
+/// Sends a file to an upload, from a client token or from your backend, while the app runs: one PUT to
+/// a single upload's URL, or the parts of a multipart upload. For an upload that goes on when the app is
+/// suspended, see `BackgroundUploader`.
 ///
 /// ```swift
 /// let completed = try await VidexoUpload().send(file: file, to: uploadURL) { progress in
@@ -205,7 +224,8 @@ public struct VidexoUpload: Sendable {
         let handle = UploadHandle()
         let delegate = UploadDelegate(
             onProgress: { _, sent, _ in onProgress?(UploadProgress(loaded: sent, total: total)) },
-            onComplete: { _, result in
+            onComplete: { _, answer in
+                let result = completedUpload(answer)
                 // A small file can end with no progress told at all, and the caller's bar should reach its end.
                 if case .success = result { onProgress?(UploadProgress(loaded: total, total: total)) }
                 handle.finish(result)
@@ -215,7 +235,7 @@ public struct VidexoUpload: Sendable {
         configuration.timeoutIntervalForResource = timeout ?? uploadURLLifetime
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         let task = session.uploadTask(with: putRequest(uploadURL, contentType: contentType ?? contentTypeOf(file)), fromFile: file)
-        handle.started(task)
+        handle.started(UploadHandle.Controls(pause: { task.suspend() }, resume: { task.resume() }, cancel: { task.cancel() }))
         task.resume()
         // The session lets go of its delegate when its one task has ended.
         session.finishTasksAndInvalidate()
@@ -232,6 +252,88 @@ public struct VidexoUpload: Sendable {
         onProgress: (@Sendable (UploadProgress) -> Void)? = nil
     ) async throws -> CompletedUpload {
         let handle = try start(file: file, to: uploadURL, contentType: contentType, timeout: timeout, onProgress: onProgress)
+        return try await withTaskCancellationHandler {
+            try await handle.value
+        } onCancel: {
+            handle.cancel()
+        }
+    }
+
+    /// Starts sending `file` to `upload`, a multipart one or a single one, and answers its handle. A
+    /// multipart upload reads its received parts first, so starting it again with the same file after
+    /// a lost connection or a relaunch sends only the parts still missing. Keep the `Upload` for that:
+    /// it is `Codable`.
+    /// - Parameters:
+    ///   - contentType: A single upload's type; by the file's extension when nil. A multipart upload's
+    ///     was set when it was created.
+    ///   - partsAtOnce: Parts sent at once, 1 to 10.
+    ///   - maxRetries: Times each part and each call is sent again after a lost connection, a timeout, a
+    ///     `429`, a `502` to `504`, or while another request still sends the part. Any other refusal ends
+    ///     the upload, which can then be started again.
+    ///   - timeout: Seconds one part, or a single upload's PUT, may take; one hour when nil.
+    ///   - onProgress: The bytes received and on their way, never less than told before; an upload that
+    ///     succeeds always ends with `loaded` equal to `total`.
+    public func start(
+        file: URL,
+        upload: Upload,
+        contentType: String? = nil,
+        partsAtOnce: Int = 3,
+        maxRetries: Int = 4,
+        timeout: TimeInterval? = nil,
+        onProgress: (@Sendable (UploadProgress) -> Void)? = nil
+    ) throws -> UploadHandle {
+        guard upload.multipart != nil else {
+            return try start(file: file, to: upload.uploadURL, contentType: contentType, timeout: timeout, onProgress: onProgress)
+        }
+        let transfer = try MultipartTransfer(
+            file: file,
+            upload: upload,
+            partsAtOnce: partsAtOnce,
+            maxRetries: maxRetries,
+            timeout: timeout,
+            onProgress: onProgress
+        )
+        let handle = UploadHandle()
+        let running = Task {
+            do {
+                handle.finish(.success(try await transfer.run()))
+            } catch let error as VidexoError {
+                handle.finish(.failure(error))
+            } catch {
+                handle.finish(.failure(sdkError(.aborted, "The upload was aborted.")))
+            }
+        }
+        handle.started(UploadHandle.Controls(
+            pause: { transfer.pause() },
+            resume: { transfer.resume() },
+            cancel: {
+                transfer.cancel()
+                running.cancel()
+            }
+        ))
+        return handle
+    }
+
+    /// `start` for `upload`, then its completed upload. Cancelling the calling task ends the upload, and
+    /// aborts a multipart one.
+    public func send(
+        file: URL,
+        upload: Upload,
+        contentType: String? = nil,
+        partsAtOnce: Int = 3,
+        maxRetries: Int = 4,
+        timeout: TimeInterval? = nil,
+        onProgress: (@Sendable (UploadProgress) -> Void)? = nil
+    ) async throws -> CompletedUpload {
+        let handle = try start(
+            file: file,
+            upload: upload,
+            contentType: contentType,
+            partsAtOnce: partsAtOnce,
+            maxRetries: maxRetries,
+            timeout: timeout,
+            onProgress: onProgress
+        )
         return try await withTaskCancellationHandler {
             try await handle.value
         } onCancel: {

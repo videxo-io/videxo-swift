@@ -335,54 +335,93 @@ private final class RefreshWaiter: @unchecked Sendable {
 public struct ClientUploads: Sendable {
     let client: VidexoClient
 
-    /// `POST /v1/client/uploads`: a one-time upload URL within the token's grant. It sends an
-    /// Idempotency-Key of its own, kept for its retries and a refresh, so a lost answer spends nothing.
+    /// `POST /v1/client/uploads`: an upload within the token's grant. It sends an Idempotency-Key of
+    /// its own, kept for its retries and a refresh, so a lost answer spends nothing.
     /// - Parameters:
     ///   - filename: A plain name: letters, digits, dots, underscores and hyphens, starting with a letter or digit.
     ///   - sizeBytes: The exact byte length.
+    ///   - multipart: Whether the file goes in parts that resume after a lost connection; needed past
+    ///     100 MB, up to the plan's input limit and the token's `max_size_bytes`.
+    ///   - partSizeBytes: With `multipart`: every part's size but the last's, 5 MiB to 64 MiB; the API's
+    ///     8 MiB when nil.
     public func create(
         filename: String,
         sizeBytes: Int,
         contentType: String = "application/octet-stream",
+        multipart: Bool = false,
+        partSizeBytes: Int? = nil,
         idempotencyKey: String? = nil
     ) async throws -> Upload {
         struct Body: Encodable {
             let filename: String
             let size_bytes: Int
             let content_type: String
+            let multipart: Bool?
+            let part_size_bytes: Int?
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        let body = try encoder.encode(Body(filename: filename, size_bytes: sizeBytes, content_type: contentType))
+        let body = try encoder.encode(Body(
+            filename: filename,
+            size_bytes: sizeBytes,
+            content_type: contentType,
+            multipart: multipart ? true : nil,
+            part_size_bytes: multipart ? partSizeBytes : nil
+        ))
         let key = idempotencyKey ?? client.environment.uuid()
         return try await client.request(VidexoClient.Call(method: "POST", path: "/v1/client/uploads", body: body, headers: ["Idempotency-Key": key]))
     }
 
     /// `create` for a file: its size, a plain form of its name, and its content type by its extension,
-    /// unless you name them. Send the bytes with `VidexoUpload` or `BackgroundUploader`.
-    public func create(forFile file: URL, filename: String? = nil, contentType: String? = nil, idempotencyKey: String? = nil) async throws -> Upload {
-        try await create(
+    /// unless you name them; multipart for a file past 100 MB unless you say. Send the bytes with
+    /// `VidexoUpload` or `BackgroundUploader`.
+    public func create(
+        forFile file: URL,
+        filename: String? = nil,
+        contentType: String? = nil,
+        multipart: Bool? = nil,
+        partSizeBytes: Int? = nil,
+        idempotencyKey: String? = nil
+    ) async throws -> Upload {
+        let size = try fileSize(file)
+        return try await create(
             filename: filename ?? plainFilename(file.lastPathComponent),
-            sizeBytes: Int(fileSize(file)),
+            sizeBytes: Int(size),
             contentType: contentType ?? contentTypeOf(file),
+            multipart: multipart ?? (size > singleUploadMaxBytes),
+            partSizeBytes: partSizeBytes,
             idempotencyKey: idempotencyKey
         )
     }
 
     /// Creates an upload and sends the file; answers the completed upload. Hand its `inputURL` to your
-    /// backend, which creates the job with its API key. A failed send is not retried: the upload URL
-    /// takes one PUT, so call this again for a new upload, within the token's `max_count`.
+    /// backend, which creates the job with its API key.
+    ///
+    /// A file past 100 MB, or any with `multipart: true`, goes as a multipart upload: three parts at a
+    /// time, each sent again after a lost connection, then completed; cancelling the calling task aborts
+    /// it. To resume one that failed, keep the `Upload` from `create` and pass it to
+    /// `VidexoUpload().send(file:upload:)`. A smaller file goes as one PUT, never retried: call this again
+    /// for a new upload, within the token's `max_count`.
     public func upload(
         file: URL,
         filename: String? = nil,
         contentType: String? = nil,
+        multipart: Bool? = nil,
+        partSizeBytes: Int? = nil,
         idempotencyKey: String? = nil,
         uploadTimeout: TimeInterval? = nil,
         onProgress: (@Sendable (UploadProgress) -> Void)? = nil
     ) async throws -> CompletedUpload {
         let type = contentType ?? contentTypeOf(file)
-        let upload = try await create(forFile: file, filename: filename, contentType: type, idempotencyKey: idempotencyKey)
-        return try await VidexoUpload().send(file: file, to: upload.uploadURL, contentType: type, timeout: uploadTimeout, onProgress: onProgress)
+        let upload = try await create(
+            forFile: file,
+            filename: filename,
+            contentType: type,
+            multipart: multipart,
+            partSizeBytes: partSizeBytes,
+            idempotencyKey: idempotencyKey
+        )
+        return try await VidexoUpload().send(file: file, upload: upload, contentType: type, timeout: uploadTimeout, onProgress: onProgress)
     }
 }
 
